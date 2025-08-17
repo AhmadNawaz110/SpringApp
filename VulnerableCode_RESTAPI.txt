@@ -1,0 +1,99 @@
+// File: VulnerableApp.java
+// Minimal Spring Boot app showing several intentional vulnerabilities
+package com.nadra.vulnlab;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.MediaType;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.sql.*;
+import java.io.*;
+import java.util.Base64;
+
+@SpringBootApplication
+@RestController
+@RequestMapping("/api")
+public class VulnerableApp {
+
+    // --------- VULNERABLE: Hardcoded DB creds & JWT secret -----------
+    // (Hardcoding secrets is insecure — included intentionally)
+    private static final String DB_URL = "jdbc:mysql://localhost:3306/nadra";
+    private static final String DB_USER = "admin";         // Hardcoded!
+    private static final String DB_PASSWORD = "Nadra@123"; // Hardcoded!
+    private static final String JWT_SECRET = "TopSecretKey"; // Hardcoded!
+
+    public static void main(String[] args) {
+        SpringApplication.run(VulnerableApp.class, args);
+    }
+
+    // ---------------- VULN 1: SQL Injection (string concat) ----------------
+    // GET /api/user?username=...
+    @GetMapping("/user")
+    public ResponseEntity<String> getUser(@RequestParam String username) throws Exception {
+        // Vulnerable: building SQL with user input (SQL injection)
+        String sql = "SELECT fullname, email FROM users WHERE username = '" + username + "'";
+        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD);
+             Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(sql)) {
+
+            if (rs.next()) {
+                return ResponseEntity.ok(rs.getString("fullname") + ";" + rs.getString("email"));
+            } else {
+                return ResponseEntity.status(404).body("Not found");
+            }
+        }
+    }
+
+    // -------- VULN 2: Unsafe file upload (no validation, write as-is) --------
+    // POST /api/upload
+    @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<String> uploadFile(@RequestParam MultipartFile file) throws Exception {
+        // No checks: name, content-type, size; writes directly to disk under web root
+        File dest = new File("./uploads/" + file.getOriginalFilename());
+        dest.getParentFile().mkdirs();
+        try (InputStream in = file.getInputStream(); OutputStream out = new FileOutputStream(dest)) {
+            byte[] buf = new byte[8192];
+            int r;
+            while ((r = in.read(buf)) != -1) out.write(buf, 0, r);
+        }
+        return ResponseEntity.ok("Uploaded to: " + dest.getAbsolutePath());
+    }
+
+    // -------- VULN 3: Integer arithmetic unchecked -> possible wraparound / OOM --------
+    // POST /api/processItems?count=...
+    @PostMapping("/processItems")
+    public ResponseEntity<String> processItems(@RequestParam int count) {
+        // Suppose we allocate an array based on count * 200
+        // Vulnerable to integer overflow (wraparound) and huge allocation
+        int bytesNeeded = count * 200; // if count is huge this can overflow or be enormous
+        byte[] buffer = new byte[bytesNeeded]; // may throw NegativeArraySizeException or OOME
+        // dummy work
+        buffer[0] = 1;
+        return ResponseEntity.ok("Processed " + count);
+    }
+
+    // -------- VULN 4: Unsafe Java deserialization (remote object) ------------
+    // POST /api/deserialize  (expects raw serialized object bytes)
+    @PostMapping(value = "/deserialize", consumes = MediaType.APPLICATION_OCTET_STREAM_VALUE)
+    public ResponseEntity<String> deserialize(InputStream body) throws Exception {
+        // Danger: reading serialized bytes from user and deserializing them
+        ObjectInputStream ois = new ObjectInputStream(body);
+        Object obj = ois.readObject();  // arbitrary class execution possible
+        // Do something dumb with it
+        return ResponseEntity.ok("Received " + obj.getClass().getName());
+    }
+
+    // -------- VULN 5: Simple "auth" check using hardcoded JWT secret ------------
+    @PostMapping("/login")
+    public ResponseEntity<String> login(@RequestParam String username, @RequestParam String password) {
+        // dummy auth: if username == password return token (vuln)
+        if (username != null && username.equals(password)) {
+            String token = Base64.getEncoder().encodeToString((username + ":" + JWT_SECRET).getBytes());
+            return ResponseEntity.ok(token); // token is trivial and uses hardcoded secret
+        }
+        return ResponseEntity.status(401).body("bad creds");
+    }
+}

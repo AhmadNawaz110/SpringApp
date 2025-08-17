@@ -1,0 +1,134 @@
+// File: SecureApp.java
+package com.nadra.vulnlab.secure;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.http.*;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.dao.EmptyResultDataAccessException;
+
+import javax.annotation.PostConstruct;
+import java.io.*;
+import java.nio.file.*;
+import java.security.MessageDigest;
+import java.util.Map;
+
+@SpringBootApplication
+@RestController
+@RequestMapping("/api")
+public class SecureApp {
+
+    private final JdbcTemplate jdbc;
+
+    public SecureApp(JdbcTemplate jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    // ---- Secrets come from environment or secret manager (not hardcoded) ----
+    @Value("${app.upload.dir:/tmp/uploads}")
+    private String uploadDir;
+
+    public static void main(String[] args) {
+        SpringApplication.run(SecureApp.class, args);
+    }
+
+    @PostConstruct
+    public void ensureUploadDir() throws IOException {
+        Files.createDirectories(Paths.get(uploadDir));
+    }
+
+    // ------------- Secure: Use parameterized queries -------------------
+    @GetMapping("/user")
+    public ResponseEntity<String> getUser(@RequestParam String username) {
+        try {
+            Map<String, Object> row = jdbc.queryForMap(
+                "SELECT fullname, email FROM users WHERE username = ?",
+                username
+            );
+            return ResponseEntity.ok(row.get("fullname") + ";" + row.get("email"));
+        } catch (EmptyResultDataAccessException e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("Not found");
+        }
+    }
+
+    // -------------- Secure file upload (validate name, size, type) --------------
+    @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<String> uploadFile(@RequestParam MultipartFile file) throws Exception {
+        // Validate file: max size, allowed extensions, sanitize filename
+        long maxBytes = 10 * 1024 * 1024; // 10 MB limit
+        if (file.getSize() <= 0 || file.getSize() > maxBytes) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Invalid file size");
+        }
+        String orig = Paths.get(file.getOriginalFilename()).getFileName().toString(); // strip path
+        if (!orig.matches("[A-Za-z0-9._-]{1,100}")) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Invalid filename");
+        }
+        // Basic content-type check (don't rely solely on it)
+        String contentType = file.getContentType();
+        if (contentType == null || (!contentType.startsWith("image/") && !contentType.equals("application/pdf"))) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Unsupported file type");
+        }
+        Path dest = Paths.get(uploadDir).resolve(orig);
+        try (InputStream in = file.getInputStream()) {
+            Files.copy(in, dest, StandardCopyOption.REPLACE_EXISTING);
+        }
+        return ResponseEntity.ok("Uploaded");
+    }
+
+    // -------------- Secure integer ops: check bounds before allocating ----------
+    @PostMapping("/processItems")
+    public ResponseEntity<String> processItems(@RequestParam int count) {
+        // Validate count
+        if (count < 0 || count > 10_000_000) { // enforce max reasonable count
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Invalid count");
+        }
+        // Use safe multiply check
+        long required = (long) count * 200L;
+        if (required > Integer.MAX_VALUE) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Requested allocation too large");
+        }
+        int bytesNeeded = (int) required;
+        byte[] buffer = new byte[bytesNeeded];
+        buffer[0] = 1;
+        return ResponseEntity.ok("Processed " + count);
+    }
+
+    // --------------- Block unsafe deserialization ---------------
+    @PostMapping(value = "/deserialize", consumes = MediaType.APPLICATION_OCTET_STREAM_VALUE)
+    public ResponseEntity<String> deserialize(InputStream body) throws Exception {
+        // Reject raw Java serialization from untrusted clients.
+        return ResponseEntity.status(HttpStatus.FORBIDDEN).body("Deserialization disabled");
+    }
+
+    // --------------- Simple secure login (DEMONSTRATION) -------------
+    @PostMapping("/login")
+    public ResponseEntity<String> login(@RequestParam String username, @RequestParam String password) {
+        // DO NOT store plaintext passwords. This is illustrative:
+        // Check password hash from DB (assume users table has password_hash column with bcrypt/argon2)
+        try {
+            String storedHash = jdbc.queryForObject(
+                "SELECT password_hash FROM users WHERE username = ?",
+                String.class, username
+            );
+            // Use proper password encoder (BCrypt/Argon2). Here we pseudo-check:
+            if (verifyPassword(password, storedHash)) {
+                // Issue JWT signed by private key or via vendor-managed auth service
+                String token = "REPLACE_WITH_REAL_JWT";
+                return ResponseEntity.ok(token);
+            } else {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("bad creds");
+            }
+        } catch (EmptyResultDataAccessException e) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("bad creds");
+        }
+    }
+
+    private boolean verifyPassword(String password, String storedHash) {
+        // Hook to real password encoder; DO NOT implement your own in prod
+        // Return false here, this is a placeholder
+        return false;
+    }
+}
